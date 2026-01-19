@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Edit",
+      "Read",
+      "Write",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(./secrets/**)",
+      "Read(**/.env)",
+      "Read(**/.env.*)"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}
