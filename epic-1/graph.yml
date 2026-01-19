@@ -1,0 +1,17 @@
+epic_number: 1
+issues:
+  2:
+    deps: []
+    title: Set up test framework and project structure
+  3:
+    deps:
+    - 2
+    title: Implement add function for basic arithmetic
+  4:
+    deps:
+    - 3
+    title: Create comprehensive README.md documentation
+  5:
+    deps:
+    - 2
+    title: Validate package integration and final testing
