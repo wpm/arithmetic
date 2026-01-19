@@ -1,0 +1,347 @@
+name: Decompose Epic
+
+on:
+  workflow_dispatch:
+    inputs:
+      epic_spec:
+        description: 'Path to epic specification file'
+        required: true
+      epic_name:
+        description: 'Epic name (e.g., "User Authentication")'
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  decompose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          cd .claude/scripts
+          uv sync
+
+      - name: Create epic tracking issue
+        id: epic_issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Ensure "epic" label exists
+          if ! gh label list | grep -q "^epic"; then
+            gh label create "epic" --description "Epic tracking issue" --color "0E8A16"
+          fi
+
+          # Read the epic spec file content
+          EPIC_CONTENT=$(cat "${{ github.event.inputs.epic_spec }}")
+
+          # Create epic issue with "epic" label
+          # gh issue create returns the URL, extract issue number from it
+          ISSUE_URL=$(gh issue create \
+            --title "${{ github.event.inputs.epic_name }}" \
+            --body "${EPIC_CONTENT}" \
+            --label "epic")
+
+          # Extract issue number from URL (last segment)
+          EPIC_ISSUE_NUMBER=$(echo "${ISSUE_URL}" | grep -oP '\d+$')
+
+          echo "epic_number=${EPIC_ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Created epic tracking issue #${EPIC_ISSUE_NUMBER}"
+
+      - name: Decompose epic with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude/scripts
+          source .venv/bin/activate
+
+          echo "Decomposing epic #${{ steps.epic_issue.outputs.epic_number }}"
+          python autonomous_agent.py decompose "../../${{ github.event.inputs.epic_spec }}" "${{ steps.epic_issue.outputs.epic_number }}" > decompose_result.json
+
+          # Check if successful
+          if [ $? -eq 0 ]; then
+            echo "✓ Epic decomposed successfully"
+            cat decompose_result.json
+          else
+            echo "✗ Decomposition failed"
+            cat decompose_result.json
+            exit 1
+          fi
+
+      - name: Build dependency graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude/scripts
+          source .venv/bin/activate
+
+          EPIC_NUMBER="${{ steps.epic_issue.outputs.epic_number }}"
+
+          # Get repository owner and name
+          REPO_INFO=$(gh repo view --json owner,name)
+          OWNER=$(echo "$REPO_INFO" | jq -r '.owner.login')
+          NAME=$(echo "$REPO_INFO" | jq -r '.name')
+
+          # Query child issues using GraphQL (sub-issues feature)
+          GRAPHQL_QUERY='query {
+            repository(owner: "'${OWNER}'", name: "'${NAME}'") {
+              issue(number: '${EPIC_NUMBER}') {
+                subIssues(first: 100) {
+                  nodes {
+                    number
+                    title
+                    body
+                  }
+                }
+              }
+            }
+          }'
+
+          gh api graphql -H "GraphQL-Features: sub_issues" -f query="${GRAPHQL_QUERY}" \
+            --jq '.data.repository.issue.subIssues.nodes' > child_issues.json
+
+          # Build graph from child issues
+          python3 << 'PYTHON'
+          import json
+          import re
+          import yaml
+
+          EPIC_NUMBER = int("${{ steps.epic_issue.outputs.epic_number }}")
+
+          # Read child issues
+          with open("child_issues.json") as f:
+              issues = json.load(f)
+
+          # Parse dependencies from issue bodies (only within this epic)
+          graph = {
+              "epic_number": EPIC_NUMBER,
+              "issues": {}
+          }
+
+          # Get all issue numbers in this epic
+          epic_issues = {issue["number"] for issue in issues}
+
+          for issue in issues:
+              issue_num = issue["number"]
+              title = issue["title"]
+              body = issue.get("body", "")
+
+              # Look for "depends on #N" or "Depends on: #N" patterns
+              deps = []
+              for match in re.finditer(r'(?i)depends\s+on[:\s]+#(\d+)', body):
+                  dep_num = int(match.group(1))
+                  # Only include deps that are in this epic and not self
+                  if dep_num != issue_num and dep_num in epic_issues:
+                      deps.append(dep_num)
+
+              # Also look for bulleted dependency lists
+              for match in re.finditer(r'(?i)^[-*]\s*#(\d+)', body, re.MULTILINE):
+                  dep_num = int(match.group(1))
+                  if dep_num != issue_num and dep_num in epic_issues:
+                      deps.append(dep_num)
+
+              # Remove duplicates and sort
+              deps = sorted(list(set(deps)))
+
+              graph["issues"][issue_num] = {
+                  "title": title,
+                  "deps": deps
+              }
+
+          # Write graph
+          with open("dependency-graph.yml", "w") as f:
+              yaml.dump(graph, f, default_flow_style=False, sort_keys=True)
+
+          print(f"Created dependency graph for epic #{EPIC_NUMBER} with {len(graph['issues'])} issues")
+          PYTHON
+
+      - name: Generate Mermaid dependency graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude/scripts
+          source .venv/bin/activate
+          EPIC_NUMBER="${{ steps.epic_issue.outputs.epic_number }}"
+
+          # Generate Mermaid diagram from dependency graph
+          python3 << 'PYTHON'
+          import yaml
+
+          EPIC_NUMBER = int("${{ steps.epic_issue.outputs.epic_number }}")
+
+          # Read dependency graph
+          with open("dependency-graph.yml") as f:
+              graph = yaml.safe_load(f)
+
+          # Generate Mermaid syntax
+          mermaid = ["```mermaid", "graph TB"]
+
+          # Add nodes with links to issues
+          for issue_num, issue_data in graph["issues"].items():
+              title = issue_data["title"]
+              # Escape special characters and truncate long titles
+              safe_title = title.replace('"', "'").replace("[", "(").replace("]", ")")
+              if len(safe_title) > 40:
+                  safe_title = safe_title[:37] + "..."
+
+              # Create clickable node
+              mermaid.append(f'    {issue_num}["{safe_title}"]')
+              mermaid.append(f'    click {issue_num} "https://github.com/${{ github.repository }}/issues/{issue_num}"')
+
+          # Add edges (dependencies)
+          for issue_num, issue_data in graph["issues"].items():
+              for dep in issue_data.get("deps", []):
+                  mermaid.append(f'    {dep} --> {issue_num}')
+
+          mermaid.append("```")
+
+          # Write to file
+          with open("mermaid.txt", "w") as f:
+              f.write("\n".join(mermaid))
+
+          print("Generated Mermaid diagram")
+          PYTHON
+
+          # Post diagram as comment to epic issue
+          MERMAID_CONTENT=$(cat mermaid.txt)
+          gh issue comment ${EPIC_NUMBER} --body "$(cat <<EOF
+          ## Dependency Graph
+
+          This diagram shows the dependencies between issues in this epic. Click on any node to view the issue.
+
+          ${MERMAID_CONTENT}
+
+          ---
+          Issues must be implemented in dependency order. An issue can only be worked on when all its dependencies (arrows pointing to it) are complete.
+          EOF
+          )"
+
+          echo "Posted Mermaid diagram to epic #${EPIC_NUMBER}"
+
+      - name: Validate dependency graph
+        run: |
+          cd .claude/scripts
+          source .venv/bin/activate
+
+          if python dependency_graph.py validate --graph dependency-graph.yml; then
+            echo "✓ Graph is valid"
+          else
+            echo "✗ Graph validation failed"
+            exit 1
+          fi
+
+      - name: Create or update state branch
+        env:
+          # Use PAT if available, otherwise GITHUB_TOKEN (manual trigger required)
+          GIT_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Save the dependency graph before switching branches
+          cp .claude/scripts/dependency-graph.yml /tmp/dependency-graph.yml
+
+          # Epic-specific state branch to avoid collisions
+          EPIC_NUMBER="${{ steps.epic_issue.outputs.epic_number }}"
+          STATE_BRANCH="epik-runs/epic-${EPIC_NUMBER}"
+
+          # Create or checkout orphan state branch
+          git fetch origin "${STATE_BRANCH}" || true
+          if git rev-parse --verify "origin/${STATE_BRANCH}" >/dev/null 2>&1; then
+            git checkout "${STATE_BRANCH}"
+          else
+            git checkout --orphan "${STATE_BRANCH}"
+            git rm -rf .
+          fi
+
+          # Run directory for storing state
+          RUN_DIR="epic-${EPIC_NUMBER}"
+          mkdir -p "${RUN_DIR}"
+
+          # Copy saved graph to state branch
+          cp /tmp/dependency-graph.yml "${RUN_DIR}/graph.yml"
+
+          # Create initial status file
+          cat > "${RUN_DIR}/status.yml" << YAML
+          epic_number: ${EPIC_NUMBER}
+          started_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          completed_issues: []
+          YAML
+
+          # Commit state
+          git add "${RUN_DIR}"
+          git commit -m "chore: initialize epic #${EPIC_NUMBER}"
+
+          # Configure remote to use token for push
+          EPIC_NUMBER="${{ steps.epic_issue.outputs.epic_number }}"
+          STATE_BRANCH="epik-runs/epic-${EPIC_NUMBER}"
+          git remote set-url origin "https://x-access-token:${GIT_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "${STATE_BRANCH}"
+
+
+      - name: Summary
+        run: |
+          EPIC_NUMBER="${{ steps.epic_issue.outputs.epic_number }}"
+
+          echo "## Decomposition Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Epic Issue:** #${EPIC_NUMBER}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get repository owner and name
+          REPO_INFO=$(gh repo view --json owner,name)
+          OWNER=$(echo "$REPO_INFO" | jq -r '.owner.login')
+          NAME=$(echo "$REPO_INFO" | jq -r '.name')
+
+          # Count child issues using GraphQL
+          GRAPHQL_QUERY='query {
+            repository(owner: "'${OWNER}'", name: "'${NAME}'") {
+              issue(number: '${EPIC_NUMBER}') {
+                subIssues(first: 100) {
+                  nodes {
+                    number
+                    title
+                  }
+                }
+              }
+            }
+          }'
+
+          CHILD_ISSUES=$(gh api graphql -H "GraphQL-Features: sub_issues" -f query="${GRAPHQL_QUERY}" --jq '.data.repository.issue.subIssues.nodes')
+          CHILD_COUNT=$(echo "${CHILD_ISSUES}" | jq 'length')
+
+          echo "Created ${CHILD_COUNT} implementation issues as children of #${EPIC_NUMBER}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Issues" >> $GITHUB_STEP_SUMMARY
+          echo "${CHILD_ISSUES}" | jq -r '.[] | "- #\(.number): \(.title)"' >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Dependency graph committed to \`epik-runs\` branch at \`runs/${EPIC_NUMBER}/\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To start implementation, run:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "epik implement ${{ github.repository }} ${EPIC_NUMBER}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        env:
+          GH_TOKEN: ${{ github.token }}
